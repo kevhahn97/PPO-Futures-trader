@@ -1,6 +1,6 @@
 import sqlite3
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import gym
 from gym import spaces, logger
@@ -199,37 +199,10 @@ class FutureTradingEnv(gym.Env):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
-    def step(self, action):
-        err_msg = "%r (%s) invalid" % (action, type(action))
-        assert self.action_space.contains(action), err_msg
-
-        self.action_buffer.append(action[0])
-
-        # get states
-        # make action: position, current_cash, average_position_price, current_account_valuation changes
-        # calculate reward for current action
-        # move 1 tick: current_chart index, current_price, average_position_price, current_account_valuation, tick_to_close changes
-
-        # done = self.tick_to_close == 0
-
-        if not self.train:
-            print(f'-------- DATE: {self.current_date} TTC: {self.tick_to_close} ----------')
-            print(f'초기 계좌 평가액: {self.initial_account_valuation}')
-            print(f'현재가: {self.current_price}')
-            print(f'계좌 평가액: {self.current_account_valuation}')
-            print(f'현금: {self.current_cash}')
-            print(f'포지션 평가액: {self.current_position_valuation}')
-            print(f'평단가: {self.average_position_price}')
-            print(f'포지션: {self.position}')
-            print(f'normalized position: {self.normalized_position}')
-            print('')
-
+    def _trade(self, new_normalized_position) -> Tuple[float, bool]:
+        old_normalized_position = self.normalized_position
         realized_profit = 0
         holded = False
-
-        # new_normalized_position = action[0] if not done else 0.
-        new_normalized_position = action[0]
-        old_normalized_position = self.normalized_position
         if old_normalized_position >= 0:
             if old_normalized_position < new_normalized_position:  # more long
                 step = self.current_price / self.current_account_valuation
@@ -442,22 +415,38 @@ class FutureTradingEnv(gym.Env):
                 self.average_position_price = new_average_position_price
                 self.position = new_position
                 self.current_cash = new_current_cash
+        return realized_profit, holded
 
-        reward = 0
-        # if is_profit_realized and False:  # realized_reward
-        #     # reward
-        #     short_term_reward = (self.current_account_valuation / self.checkpoint_account_valuation) - 1.0
-        #     long_term_reward = (self.current_account_valuation / self.initial_account_valuation) - 1.0
-        #     short_term_reward = short_term_reward ** 3
-        #     short_term_reward *= 0.1
-        #     reward += short_term_reward
-        #     # if done:
-        #     #     reward += long_term_reward
-        #     # if reward > 0:
-        #     #     reward *= 10
-        #     # reward += 1  # normalize reward
-        #     # reward *= 100
-        #     self.checkpoint_account_valuation = self.current_account_valuation
+    def step(self, action):
+        err_msg = "%r (%s) invalid" % (action, type(action))
+        assert self.action_space.contains(action), err_msg
+
+        self.action_buffer.append(action[0])
+
+        # get states
+        # make action: position, current_cash, average_position_price, current_account_valuation changes
+        # calculate reward for current action
+        # move 1 tick: current_chart index, current_price, average_position_price, current_account_valuation, tick_to_close changes
+
+        # done = self.tick_to_close == 0
+
+        if not self.train:
+            print(f'-------- DATE: {self.current_date} TTC: {self.tick_to_close} ----------')
+            print(f'초기 계좌 평가액: {self.initial_account_valuation}')
+            print(f'현재가: {self.current_price}')
+            print(f'계좌 평가액: {self.current_account_valuation}')
+            print(f'현금: {self.current_cash}')
+            print(f'포지션 평가액: {self.current_position_valuation}')
+            print(f'평단가: {self.average_position_price}')
+            print(f'포지션: {self.position}')
+            print(f'normalized position: {self.normalized_position}')
+            print('')
+
+        # new_normalized_position = action[0] if not done else 0.
+        new_normalized_position = action[0]
+        old_position = self.position
+        realized_profit, holded = self._trade(new_normalized_position=new_normalized_position)
+
         assert (holded and (realized_profit == 0)) or not holded, 'Something is wrong'
         if not self.train:
             print(f'action: {action}')
@@ -466,10 +455,23 @@ class FutureTradingEnv(gym.Env):
             else:
                 print(f'*** {old_position} -> {self.position} ({self.position - old_position}) ***')
 
-        if realized_profit != 0:  # realized reward
+        reward = 0
+
+        use_realized_reward = False
+        allow_negative_r = True
+
+        use_position_reward = False
+        allow_negative_p = False
+
+        use_done_reward = True
+        allow_negative_d = True
+
+        assert use_done_reward ^ use_realized_reward, 'done reward and realized reward cannot be used together'
+
+        if use_realized_reward:  # realized reward
             if not self.train:
                 print(f'realized profit: {realized_profit}')
-            if realized_profit > 0 or False:  # positive only
+            if realized_profit > 0 or allow_negative_r:  # allow negative?
                 reward += realized_profit / self.initial_account_valuation
 
         # tick
@@ -482,25 +484,27 @@ class FutureTradingEnv(gym.Env):
                 columns = self.current_chart[ic]['columns']
                 past_tick_price = self.current_price
                 self.current_price = self.current_chart[ic]['data'][new_idx][columns.index('close')]
-                if self.position != 0:  # position reward
+                if use_position_reward:  # position reward
                     delta_price = self.current_price - past_tick_price
                     position_reward = delta_price * self.position / self.initial_account_valuation
                     # position_reward = position_reward ** 3
                     if not self.train:
                         print(f'delta position: {delta_price * self.position}')
-                    if position_reward > 0 or False:
+                    if position_reward > 0 or allow_negative_p:  # allow negative?
                         if holded and False:  # hold bonus
                             position_reward *= 2
                         reward += position_reward
 
         done = self.tick_to_close == 0
-        if done:  # done reward
-            realization_penalty = self.current_price * abs(self.position) * self.penalty
-            long_term_reward = ((self.current_account_valuation - realization_penalty) / self.initial_account_valuation) - 1.0
-            # long_term_reward = long_term_reward ** 3
-            # long_term_reward *= 100
-            if long_term_reward > 0 or False:
-                reward += long_term_reward
+        if done:
+            realized_profit, _ = self._trade(new_normalized_position=0.)  # liquidate all
+            if use_done_reward:  # done reward
+                done_reward = (self.current_account_valuation / self.initial_account_valuation) - 1.0
+                if done_reward > 0 or allow_negative_d:
+                    reward += done_reward
+            elif use_realized_reward:  # realized reward at last step
+                if realized_profit > 0 or allow_negative_r:  # allow negative?
+                    reward += realized_profit / self.initial_account_valuation
 
         return self._observe(), reward, done, {}
 

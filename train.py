@@ -81,7 +81,7 @@ def get_geometric_average_and_cummulative_profit(model, env: FutureTradingEnv, e
                 profit_list.append(daily_profit)
                 if verbose == 1:
                     print(f'date: {env.current_date}\tprofit: {daily_profit * 100:.3f}%')
-                    # env.render()
+                    env.render()
     profits = np.asarray(profit_list, dtype=np.float64)
     profits += 1
     cummulative_profit = profits.prod()
@@ -154,20 +154,20 @@ def backup_source(source_backup_dir):
         shutil.copy(source, target_path)
 
 
-n_envs = 16
+n_envs = 1
 n_steps = 377
 db_file_path = 'db/200810_025124_주식분봉_122630.db'
 input_config = {'1분': {'N': 128, 'columns': ['open', 'high', 'low', 'close']}}
 penalty = 0.003
 train_start = 20190801
 train_end = 20200131
-# train_end = 20190802
+train_end = 20190802
 valid_start = 20200203
 valid_end = 20200801
-# valid_end = 20200204
+valid_end = 20200204
 env = make_vec_env(FutureTradingEnv, n_envs, env_kwargs=dict(db_file_path=db_file_path, start_date=train_start, end_date=train_end, input_config=input_config, penalty=penalty))
 
-memo = '127days_iav_base_reward_negative_rpd_xxx_16env_4mini'
+memo = 'fitting_iav_base_reward_fixed_d'
 if memo is None:
     memo = input('memo: ')
 version = get_version(memo=memo, log_base_dir='log')
@@ -183,7 +183,7 @@ os.makedirs(backup_dir, exist_ok=True)
 backup_source(source_backup_dir=backup_dir)
 
 # model = PPO2(FeedForwardPolicy, env, verbose=1, n_steps=378, policy_kwargs=dict(feature_extraction="cnn", cnn_extractor=get_ext(input_config)))
-model = PPO2(MlpPolicy, env, verbose=1, n_steps=n_steps, nminibatches=4, tensorboard_log=tensorboard_dir)
+model = PPO2(MlpPolicy, env, verbose=1, n_steps=n_steps, nminibatches=1, tensorboard_log=tensorboard_dir)
 # model = PPO2(MlpLstmPolicy, env, verbose=1, n_steps=n_steps, nminibatches=1, tensorboard_log=tensorboard_dir)
 
 train_env = FutureTradingEnv(db_file_path=db_file_path, start_date=train_start, end_date=train_end, input_config=input_config, penalty=penalty, train=True)
