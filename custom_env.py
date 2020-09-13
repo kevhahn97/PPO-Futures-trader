@@ -76,12 +76,13 @@ class FutureTradingEnv(gym.Env):
         'video.frames_per_second': 50
     }
 
-    def __init__(self, db_file_path, start_date, end_date, input_config: dict, penalty=0.003):
+    def __init__(self, db_file_path, start_date, end_date, input_config: dict, penalty=0.003, train=True):
         self.ticks_per_trading_day = 378  # 15:19 - 09:01 = total 378 ticks. hence, it has 378 steps of size 1/377
         self.db_file_path = db_file_path
         self.start_date = start_date
         self.end_date = end_date
         self.input_config = input_config
+        self.train = train
 
         self.db_connection = None
         self.db_cursor = None
@@ -94,6 +95,7 @@ class FutureTradingEnv(gym.Env):
         self.current_date_idx = None
         self.initial_account_valuation = None
         self.checkpoint_account_valuation = None
+        self.action_buffer = None
 
         # states (changes every step)
         self.current_chart = None
@@ -201,16 +203,32 @@ class FutureTradingEnv(gym.Env):
         err_msg = "%r (%s) invalid" % (action, type(action))
         assert self.action_space.contains(action), err_msg
 
+        self.action_buffer.append(action[0])
+
         # get states
         # make action: position, current_cash, average_position_price, current_account_valuation changes
         # calculate reward for current action
         # move 1 tick: current_chart index, current_price, average_position_price, current_account_valuation, tick_to_close changes
 
-        done = self.tick_to_close == 0
+        # done = self.tick_to_close == 0
 
-        is_profit_realized = False
+        if not self.train:
+            print(f'-------- DATE: {self.current_date} TTC: {self.tick_to_close} ----------')
+            print(f'초기 계좌 평가액: {self.initial_account_valuation}')
+            print(f'현재가: {self.current_price}')
+            print(f'계좌 평가액: {self.current_account_valuation}')
+            print(f'현금: {self.current_cash}')
+            print(f'포지션 평가액: {self.current_position_valuation}')
+            print(f'평단가: {self.average_position_price}')
+            print(f'포지션: {self.position}')
+            print(f'normalized position: {self.normalized_position}')
+            print('')
 
-        new_normalized_position = action[0] if not done else 0.
+        realized_profit = 0
+        holded = False
+
+        # new_normalized_position = action[0] if not done else 0.
+        new_normalized_position = action[0]
         old_normalized_position = self.normalized_position
         if old_normalized_position >= 0:
             if old_normalized_position < new_normalized_position:  # more long
@@ -220,24 +238,26 @@ class FutureTradingEnv(gym.Env):
                 old_average_position_price = self.average_position_price
                 old_current_cash = self.current_cash
 
-                num_contracts = int(round((new_normalized_position - old_normalized_position) / step, 1))
-                assert num_contracts >= 0
-                contract_valuation = num_contracts * self.current_price
+                delta_position = int(round((new_normalized_position - old_normalized_position) / step, 8))
+                assert delta_position >= 0
+                contract_valuation = delta_position * self.current_price
                 assert contract_valuation >= 0
 
-                new_position = old_position + num_contracts
+                holded = delta_position == 0
+                new_position = old_position + delta_position
                 if new_position == 0:
                     new_average_position_price = 0
                 else:
                     assert new_position > 0
                     new_average_position_price = (old_position * old_average_position_price + contract_valuation) / new_position
                 new_current_cash = old_current_cash - abs(contract_valuation) * (1 + 0)  # 0 penalty for buying
+                assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
                 self.current_cash = new_current_cash
             elif old_normalized_position == new_normalized_position:  # hold
-                pass
+                holded = True
             elif 0 <= new_normalized_position < old_normalized_position:  # liquidate long
                 step = self.current_price / self.current_account_valuation
 
@@ -245,24 +265,28 @@ class FutureTradingEnv(gym.Env):
                 old_average_position_price = self.average_position_price
                 old_current_cash = self.current_cash
 
-                num_contracts = int(round((new_normalized_position - old_normalized_position) / step, 1))
-                assert num_contracts <= 0
-                contract_valuation = num_contracts * self.current_price
+                delta_position = int(round((new_normalized_position - old_normalized_position) / step, 8))
+                assert delta_position <= 0
+                contract_valuation = delta_position * self.current_price
                 assert contract_valuation <= 0
 
-                new_position = old_position + num_contracts
+                holded = delta_position == 0
+                new_position = old_position + delta_position
                 if new_position == 0:
                     new_average_position_price = 0
                 else:
                     assert new_position > 0
                     new_average_position_price = old_average_position_price
-                new_current_cash = old_current_cash + abs(contract_valuation) * (1 - self.penalty)
+                realization_penalty = abs(contract_valuation) * self.penalty
+                new_current_cash = old_current_cash + abs(contract_valuation) - realization_penalty
+                assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
                 self.current_cash = new_current_cash
 
-                is_profit_realized = num_contracts != 0
+                if delta_position != 0:  # < 0
+                    realized_profit = (self.current_price - old_average_position_price) * abs(delta_position) - realization_penalty
             elif new_normalized_position < 0:  # liquidate all long and switch to short
                 step = self.current_price / self.current_account_valuation
 
@@ -270,34 +294,45 @@ class FutureTradingEnv(gym.Env):
                 old_average_position_price = self.average_position_price
                 old_current_cash = self.current_cash
 
-                num_contracts = int(round((0 - old_normalized_position) / step, 1))
-                assert num_contracts <= 0
-                contract_valuation = num_contracts * self.current_price
+                delta_position = int(round((0 - old_normalized_position) / step, 8))
+                assert delta_position <= 0
+                contract_valuation = delta_position * self.current_price
                 assert contract_valuation <= 0
 
-                assert old_position + num_contracts == 0
-                new_current_cash = old_current_cash + abs(contract_valuation) * (1 - self.penalty)
+                assert old_position + delta_position == 0
+                realization_penalty = abs(contract_valuation) * self.penalty
+                new_current_cash = old_current_cash + abs(contract_valuation) - realization_penalty
+                assert new_current_cash >= 0
+
+                self.average_position_price = 0
+                self.position = 0
+                self.current_cash = new_current_cash
                 # liquidate done
 
+                if delta_position != 0:  # < 0
+                    realized_profit = (self.current_price - old_average_position_price) * abs(delta_position) - realization_penalty
+
                 # short
-                num_short_contracts = int(round((new_normalized_position - 0) / step, 1))
-                assert num_short_contracts <= 0
-                short_contract_valuation = num_short_contracts * self.current_price
+                step = self.current_price / self.current_account_valuation
+                delta_short_position = int(round((new_normalized_position - 0) / step, 8))
+                assert delta_short_position <= 0
+                short_contract_valuation = delta_short_position * self.current_price
                 assert short_contract_valuation <= 0
 
-                new_position = num_short_contracts
+                holded = delta_position == 0 and delta_short_position == 0
+
+                new_position = delta_short_position
                 if new_position == 0:
                     new_average_position_price = 0
                 else:
                     assert new_position < 0
                     new_average_position_price = abs(short_contract_valuation / new_position)
                 new_current_cash = new_current_cash - abs(short_contract_valuation) * (1 + 0)  # 0 penalty for buy
+                assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
                 self.current_cash = new_current_cash
-
-                is_profit_realized = num_contracts != 0
         else:
             if new_normalized_position < old_normalized_position:  # more short
                 step = self.current_price / self.current_account_valuation
@@ -306,12 +341,14 @@ class FutureTradingEnv(gym.Env):
                 old_average_position_price = self.average_position_price
                 old_current_cash = self.current_cash
 
-                num_contracts = int(round((new_normalized_position - old_normalized_position) / step, 1))
-                assert num_contracts <= 0
-                contract_valuation = num_contracts * self.current_price
+                delta_position = int(round((new_normalized_position - old_normalized_position) / step, 8))
+                assert delta_position <= 0
+                contract_valuation = delta_position * self.current_price
                 assert contract_valuation <= 0
 
-                new_position = old_position + num_contracts
+                holded = delta_position == 0
+
+                new_position = old_position + delta_position
                 if new_position == 0:
                     new_average_position_price = 0
                 else:
@@ -320,12 +357,13 @@ class FutureTradingEnv(gym.Env):
                     # same as
                     # new_average_position_price = (old_position * old_average_position_price + contract_valuation) / new_position
                 new_current_cash = old_current_cash - abs(contract_valuation) * (1 + 0)  # 0 penalty for buy
+                assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
                 self.current_cash = new_current_cash
             elif old_normalized_position == new_normalized_position:  # hold
-                pass
+                holded = True
             elif old_normalized_position < new_normalized_position <= 0:  # liquidate short
                 step = (2 * self.average_position_price - self.current_price) / self.current_account_valuation
 
@@ -333,24 +371,29 @@ class FutureTradingEnv(gym.Env):
                 old_average_position_price = self.average_position_price
                 old_current_cash = self.current_cash
 
-                num_contracts = int(round((new_normalized_position - old_normalized_position) / step, 1))
-                assert num_contracts >= 0
-                contract_valuation = num_contracts * (2 * old_average_position_price - self.current_price)
+                delta_position = int(round((new_normalized_position - old_normalized_position) / step, 8))
+                assert delta_position >= 0
+                contract_valuation = delta_position * (2 * old_average_position_price - self.current_price)
                 assert contract_valuation >= 0
 
-                new_position = old_position + num_contracts
+                holded = delta_position == 0
+
+                new_position = old_position + delta_position
                 if new_position == 0:
                     new_average_position_price = 0
                 else:
                     assert new_position < 0
                     new_average_position_price = old_average_position_price
-                new_current_cash = old_current_cash + abs(contract_valuation) * (1 - self.penalty)
+                realization_penalty = abs(contract_valuation) * self.penalty
+                new_current_cash = old_current_cash + abs(contract_valuation) - realization_penalty
+                assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
                 self.current_cash = new_current_cash
 
-                is_profit_realized = num_contracts != 0
+                if delta_position != 0:  # > 0
+                    realized_profit = (old_average_position_price - self.current_price) * abs(delta_position) - realization_penalty
             elif 0 < new_normalized_position:  # liquidate all short and switch to long
                 step = (2 * self.average_position_price - self.current_price) / self.current_account_valuation
 
@@ -358,56 +401,106 @@ class FutureTradingEnv(gym.Env):
                 old_average_position_price = self.average_position_price
                 old_current_cash = self.current_cash
 
-                num_contracts = int(round((0 - old_normalized_position) / step, 1))
-                assert num_contracts >= 0
-                contract_valuation = num_contracts * (2 * old_average_position_price - self.current_price)
+                delta_position = int(round((0 - old_normalized_position) / step, 8))
+                assert delta_position >= 0
+                contract_valuation = delta_position * (2 * old_average_position_price - self.current_price)
                 assert contract_valuation >= 0
 
-                assert old_position + num_contracts == 0
-                new_current_cash = old_current_cash + abs(contract_valuation) * (1 - self.penalty)
+                assert old_position + delta_position == 0
+                realization_penalty = abs(contract_valuation) * self.penalty
+                new_current_cash = old_current_cash + abs(contract_valuation) - realization_penalty
+                assert new_current_cash >= 0
+
+                self.average_position_price = 0
+                self.position = 0
+                self.current_cash = new_current_cash
                 # liquidate done
 
-                # long
-                long_step = self.current_price / self.current_account_valuation
+                if delta_position != 0:  # > 0
+                    realized_profit = (old_average_position_price - self.current_price) * abs(delta_position) - realization_penalty
 
-                num_long_contracts = int(round((new_normalized_position - 0) / long_step, 1))
-                assert num_long_contracts >= 0
-                long_contract_valuation = num_long_contracts * self.current_price
+                # long
+                long_step = self.current_price / (self.current_account_valuation)
+
+                delta_long_position = int(round((new_normalized_position - 0) / long_step, 8))
+                assert delta_long_position >= 0
+                long_contract_valuation = delta_long_position * self.current_price
                 assert long_contract_valuation >= 0
 
-                new_position = num_long_contracts
+                holded = delta_position == 0 and delta_long_position == 0
+                assert not holded, 'Variable holded can not be True in this case'
+
+                new_position = delta_long_position
                 if new_position == 0:
                     new_average_position_price = 0
                 else:
                     assert new_position > 0
                     new_average_position_price = abs(long_contract_valuation / new_position)
                 new_current_cash = new_current_cash - abs(long_contract_valuation) * (1 + 0)  # 0 penalty for buy
+                assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
                 self.current_cash = new_current_cash
 
-                is_profit_realized = num_contracts != 0
-        if is_profit_realized or True:
-            # reward
-            short_term_reward = (self.current_account_valuation / self.checkpoint_account_valuation) - 1.0
-            long_term_reward = (self.current_account_valuation / self.initial_account_valuation) - 1.0
-            reward = short_term_reward + long_term_reward * 0
-            reward *= 100
-            self.checkpoint_account_valuation = self.current_account_valuation
-        else:
-            reward = 0
+        reward = 0
+        # if is_profit_realized and False:  # realized_reward
+        #     # reward
+        #     short_term_reward = (self.current_account_valuation / self.checkpoint_account_valuation) - 1.0
+        #     long_term_reward = (self.current_account_valuation / self.initial_account_valuation) - 1.0
+        #     short_term_reward = short_term_reward ** 3
+        #     short_term_reward *= 0.1
+        #     reward += short_term_reward
+        #     # if done:
+        #     #     reward += long_term_reward
+        #     # if reward > 0:
+        #     #     reward *= 10
+        #     # reward += 1  # normalize reward
+        #     # reward *= 100
+        #     self.checkpoint_account_valuation = self.current_account_valuation
+        assert (holded and (realized_profit == 0)) or not holded, 'Something is wrong'
+        if not self.train:
+            print(f'action: {action}')
+            if holded:
+                print(f'*** HOLD {self.position} ***')
+            else:
+                print(f'*** {old_position} -> {self.position} ({self.position - old_position}) ***')
 
-        if not done:
-            # tick
-            # evaluate current_price
-            self.tick_to_close -= 1
-            for ic in self.input_config:
-                if ic == '1분':
-                    self.current_chart[ic]['current_idx'] += 1
-                    new_idx = self.current_chart[ic]['current_idx']
-                    columns = self.current_chart[ic]['columns']
-                    self.current_price = self.current_chart[ic]['data'][new_idx][columns.index('close')]
+        if realized_profit != 0:  # realized reward
+            if not self.train:
+                print(f'realized profit: {realized_profit}')
+            if realized_profit > 0 or False:  # positive only
+                reward += realized_profit / self.initial_account_valuation
+
+        # tick
+        # evaluate current_price
+        self.tick_to_close -= 1
+        for ic in self.input_config:
+            if ic == '1분':
+                self.current_chart[ic]['current_idx'] += 1
+                new_idx = self.current_chart[ic]['current_idx']
+                columns = self.current_chart[ic]['columns']
+                past_tick_price = self.current_price
+                self.current_price = self.current_chart[ic]['data'][new_idx][columns.index('close')]
+                if self.position != 0:  # position reward
+                    delta_price = self.current_price - past_tick_price
+                    position_reward = delta_price * self.position / self.initial_account_valuation
+                    # position_reward = position_reward ** 3
+                    if not self.train:
+                        print(f'delta position: {delta_price * self.position}')
+                    if position_reward > 0 or False:
+                        if holded and False:  # hold bonus
+                            position_reward *= 2
+                        reward += position_reward
+
+        done = self.tick_to_close == 0
+        if done:  # done reward
+            realization_penalty = self.current_price * abs(self.position) * self.penalty
+            long_term_reward = ((self.current_account_valuation - realization_penalty) / self.initial_account_valuation) - 1.0
+            # long_term_reward = long_term_reward ** 3
+            # long_term_reward *= 100
+            if long_term_reward > 0 or False:
+                reward += long_term_reward
 
         return self._observe(), reward, done, {}
 
@@ -429,7 +522,8 @@ class FutureTradingEnv(gym.Env):
         data, columns = self._get_chart_data('1분', query_start_date_time, query_end_date_time)
         date_idx = columns.index('date')
         self.parsed_date_list = sorted(list(set((data[:, date_idx] // 1000000).tolist())))
-        self.simulatable_date_idx_list = range(required_past_dates, len(self.parsed_date_list))
+        assert required_past_dates < len(self.parsed_date_list), f'At least {required_past_dates} + 1 dates are required for simulation'
+        self.simulatable_date_idx_list = list(range(required_past_dates, len(self.parsed_date_list)))
 
     def _add_time_to_date(self, date: int, time: int) -> int:
         d, t = f'{date:08}', f'{time:06}'
@@ -440,7 +534,6 @@ class FutureTradingEnv(gym.Env):
     def _prepare_1min_chart(self):
         ic = '1분'
         required_past_dates = math.ceil(self.input_config[ic]['N'] / 378)
-
         query_start_date_time = self._add_time_to_date(self.parsed_date_list[self.current_date_idx - required_past_dates], 000000)
         query_end_date_time = self._add_time_to_date(self.parsed_date_list[self.current_date_idx - 1], 999999)
         past_data, _ = self._get_chart_data(ic, query_start_date_time, query_end_date_time)
@@ -475,10 +568,11 @@ class FutureTradingEnv(gym.Env):
         return self.current_account_valuation / self.initial_account_valuation - 1
 
     def print_profit(self):
-        if self.tick_to_close == 0:
+        if self.tick_to_close == 1:
             print(f'Market closed. Current profit: {self.get_daily_profit() * 100}%')
 
     def reset(self, code: Optional[str] = None, date_idx: Optional[int] = None):
+        self.action_buffer = []
         # choose code from db and date between [self.start_date, self.end_date]
         if self.db_cursor is None:
             self.db_cursor = self.db_connection.cursor()
@@ -492,6 +586,7 @@ class FutureTradingEnv(gym.Env):
 
         self.current_date_idx = np.random.choice(self.simulatable_date_idx_list) if date_idx is None else date_idx
         self.current_date = self.parsed_date_list[self.current_date_idx]
+        assert self.current_date_idx in self.simulatable_date_idx_list, 'Given date is not in range of simulation'
 
         self.current_chart = dict()
         assert '1분' in self.input_config, '1분봉은 필수'
@@ -510,6 +605,7 @@ class FutureTradingEnv(gym.Env):
             self.average_position_price = 0
             self.position = 0
             self.current_cash = int(np.random.uniform(500, 10000)) * 1000
+            # self.current_cash = 10000000
             self.checkpoint_account_valuation = self.initial_account_valuation = self.current_account_valuation
             self.current_cash = self.initial_account_valuation
         else:
@@ -521,58 +617,10 @@ class FutureTradingEnv(gym.Env):
         return self._observe()
 
     def render(self, mode='human'):
-        screen_width = 600
-        screen_height = 400
-
-        world_width = self.x_threshold * 2
-        scale = screen_width / world_width
-        carty = 100  # TOP OF CART
-        polewidth = 10.0
-        polelen = scale * (2 * self.length)
-        cartwidth = 50.0
-        cartheight = 30.0
-
-        if self.viewer is None:
-            from gym.envs.classic_control import rendering
-            self.viewer = rendering.Viewer(screen_width, screen_height)
-            l, r, t, b = -cartwidth / 2, cartwidth / 2, cartheight / 2, -cartheight / 2
-            axleoffset = cartheight / 4.0
-            cart = rendering.FilledPolygon([(l, b), (l, t), (r, t), (r, b)])
-            self.carttrans = rendering.Transform()
-            cart.add_attr(self.carttrans)
-            self.viewer.add_geom(cart)
-            l, r, t, b = -polewidth / 2, polewidth / 2, polelen - polewidth / 2, -polewidth / 2
-            pole = rendering.FilledPolygon([(l, b), (l, t), (r, t), (r, b)])
-            pole.set_color(.8, .6, .4)
-            self.poletrans = rendering.Transform(translation=(0, axleoffset))
-            pole.add_attr(self.poletrans)
-            pole.add_attr(self.carttrans)
-            self.viewer.add_geom(pole)
-            self.axle = rendering.make_circle(polewidth / 2)
-            self.axle.add_attr(self.poletrans)
-            self.axle.add_attr(self.carttrans)
-            self.axle.set_color(.5, .5, .8)
-            self.viewer.add_geom(self.axle)
-            self.track = rendering.Line((0, carty), (screen_width, carty))
-            self.track.set_color(0, 0, 0)
-            self.viewer.add_geom(self.track)
-
-            self._pole_geom = pole
-
-        if self.state is None:
-            return None
-
-        # Edit the pole polygon vertex
-        pole = self._pole_geom
-        l, r, t, b = -polewidth / 2, polewidth / 2, polelen - polewidth / 2, -polewidth / 2
-        pole.v = [(l, b), (l, t), (r, t), (r, b)]
-
-        x = self.state
-        cartx = x[0] * scale + screen_width / 2.0  # MIDDLE OF CART
-        self.carttrans.set_translation(cartx, carty)
-        self.poletrans.set_rotation(-x[2])
-
-        return self.viewer.render(return_rgb_array=mode == 'rgb_array')
+        print('\n------------- RENDER START -------------')
+        print(f'code: {self.current_code}, date: {self.current_date}')
+        print(self.action_buffer)
+        print('------------- RENDER DONE -------------\n')
 
     def close(self):
         if self.viewer:
@@ -581,7 +629,25 @@ class FutureTradingEnv(gym.Env):
 
 
 if __name__ == '__main__':
-    env = FutureTradingEnv(db_file_path='C:\\Users\\hanseungho\\stocks\\Kiwoom_datareader\\db\\200810_025124_주식분봉_122630.db', start_date=20190801, end_date=20200131, input_config={'1분': {'N': 128, 'columns': ['open', 'high', 'low', 'close']}})
+    db_file_path = 'db/200810_025124_주식분봉_122630.db'
+    env = FutureTradingEnv(db_file_path=db_file_path, start_date=20190801, end_date=20200131, input_config={'1분': {'N': 128, 'columns': ['open', 'high', 'low', 'close']}})
 
     d = env.reset()
+    while True:
+        cav, iav, price, ttc, cpv, cash, p, app, norm_p = env.current_account_valuation, env.initial_account_valuation, env.current_price, env.tick_to_close, env.current_position_valuation, env.current_cash, env.position, env.average_position_price, env.normalized_position
+        print('-----계좌 정보-----')
+        print(f'초기 계좌 평가액: {iav}')
+        print(f'현재가: {price}')
+        print(f'계좌 평가액: {cav}')
+        print(f'현금: {cash}')
+        print(f'포지션 평가액: {cpv}')
+        print(f'평단가: {app}')
+        print(f'포지션: {p}')
+        print(f'normalized position: {norm_p}')
+        action = np.random.uniform(-1, 1, (1,))
+        print(f'-----action = {action}-----')
+        _, reward, done, _ = env.step(action)
+        print(f'reward: {reward}')
+        print(f'done: {done}')
+        print(f'-----------------------------\n')
     print(d)

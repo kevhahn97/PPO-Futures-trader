@@ -1,4 +1,6 @@
+import glob
 import os
+import shutil
 from typing import Optional
 
 from stable_baselines.common import make_vec_env
@@ -61,11 +63,10 @@ def get_ext(input_config):
 
 def get_geometric_average_and_cummulative_profit(model, env: FutureTradingEnv, env_name: str, code: Optional[str] = None, verbose: int = 1):
     env.reset(code=code)
-    num_dates = len(env.parsed_date_list)
     profit_list = list()
     if verbose == 1:
         print(f'\n---------- start simulating {env_name} -----------')
-    for date_idx in range(num_dates):
+    for date_idx in env.simulatable_date_idx_list:
         obs = env.reset(code=code, date_idx=date_idx)
         done = False
         while not done:
@@ -80,6 +81,7 @@ def get_geometric_average_and_cummulative_profit(model, env: FutureTradingEnv, e
                 profit_list.append(daily_profit)
                 if verbose == 1:
                     print(f'date: {env.current_date}\tprofit: {daily_profit * 100:.3f}%')
+                    # env.render()
     profits = np.asarray(profit_list, dtype=np.float64)
     profits += 1
     cummulative_profit = profits.prod()
@@ -131,28 +133,66 @@ class ProfitCallback(BaseCallback):
         return True
 
 
-n_envs = 1
-n_steps = 378
+def get_version(memo: str, log_base_dir='log'):
+    version_list = os.listdir(log_base_dir)
+    version_list = list(map(lambda x: int(x.split('_')[1]), version_list))
+    version_list.sort()
+    if len(version_list) == 0:
+        version = 1
+    else:
+        version = version_list[-1] + 1
+    version = f'v_{version}_{memo}'
+    print(f'train version: {version}')
+    return version
+
+
+def backup_source(source_backup_dir):
+    source_list = glob.glob('*.py') + glob.glob('*.yml') + glob.glob('*.sh')
+    for source in source_list:
+        target_path = os.path.join(source_backup_dir, source)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        shutil.copy(source, target_path)
+
+
+n_envs = 16
+n_steps = 377
+db_file_path = 'db/200810_025124_주식분봉_122630.db'
 input_config = {'1분': {'N': 128, 'columns': ['open', 'high', 'low', 'close']}}
-env = make_vec_env(FutureTradingEnv, n_envs, env_kwargs=dict(db_file_path='C:\\Users\\hanseungho\\stocks\\Kiwoom_datareader\\db\\200810_025124_주식분봉_122630.db', start_date=20190801, end_date=20200131, input_config=input_config))
+penalty = 0.003
+train_start = 20190801
+train_end = 20200131
+# train_end = 20190802
+valid_start = 20200203
+valid_end = 20200801
+# valid_end = 20200204
+env = make_vec_env(FutureTradingEnv, n_envs, env_kwargs=dict(db_file_path=db_file_path, start_date=train_start, end_date=train_end, input_config=input_config, penalty=penalty))
 
-version = 'v_4_mlp_always_reward'
+memo = '127days_iav_base_reward_negative_rpd_xxx_16env_4mini'
+if memo is None:
+    memo = input('memo: ')
+version = get_version(memo=memo, log_base_dir='log')
 
-tensorboard_dir = os.path.join('log', 'tb')
-checkpoint_dir = os.path.join('log', 'ckpt', version)
+log_dir = os.path.join('log', version)
+tensorboard_dir = os.path.join(log_dir, 'tb')
+checkpoint_dir = os.path.join(log_dir, 'ckpt')
+backup_dir = os.path.join(log_dir, 'backup')
 os.makedirs(tensorboard_dir, exist_ok=True)
 os.makedirs(checkpoint_dir, exist_ok=True)
+os.makedirs(backup_dir, exist_ok=True)
+
+backup_source(source_backup_dir=backup_dir)
 
 # model = PPO2(FeedForwardPolicy, env, verbose=1, n_steps=378, policy_kwargs=dict(feature_extraction="cnn", cnn_extractor=get_ext(input_config)))
-model = PPO2(MlpPolicy, env, verbose=1, n_steps=n_steps, nminibatches=1, tensorboard_log=tensorboard_dir)
+model = PPO2(MlpPolicy, env, verbose=1, n_steps=n_steps, nminibatches=4, tensorboard_log=tensorboard_dir)
 # model = PPO2(MlpLstmPolicy, env, verbose=1, n_steps=n_steps, nminibatches=1, tensorboard_log=tensorboard_dir)
 
-train_env = FutureTradingEnv(db_file_path='C:\\Users\\hanseungho\\stocks\\Kiwoom_datareader\\db\\200810_025124_주식분봉_122630.db', start_date=20190801, end_date=20200131, input_config=input_config)
-valid_env = FutureTradingEnv(db_file_path='C:\\Users\\hanseungho\\stocks\\Kiwoom_datareader\\db\\200810_025124_주식분봉_122630.db', start_date=20200131, end_date=20200801, input_config=input_config)
+train_env = FutureTradingEnv(db_file_path=db_file_path, start_date=train_start, end_date=train_end, input_config=input_config, penalty=penalty, train=True)
+valid_env = FutureTradingEnv(db_file_path=db_file_path, start_date=valid_start, end_date=valid_end, input_config=input_config, penalty=penalty, train=True)
 
 num_episode = 10000
 steps_per_epoch = 64
 for epoch in range(num_episode):
     print(f'\n***Epoch {epoch}/{num_episode} start***')
-    model.learn(total_timesteps=n_steps * n_envs * steps_per_epoch, callback=ProfitCallback(train_env, valid_env, epoch=epoch, checkpointing_metric='geometric_average', checkpoint_dir=checkpoint_dir, verbose=1), reset_num_timesteps=False, tb_log_name=version)
+    print(f'version: {version}')
+    model.learn(total_timesteps=n_steps * n_envs * steps_per_epoch, callback=ProfitCallback(train_env, valid_env, epoch=epoch, checkpointing_metric='geometric_average', checkpoint_dir=checkpoint_dir, verbose=1), reset_num_timesteps=False)
     print(f'***Epoch {epoch}/{num_episode} done***\n')
