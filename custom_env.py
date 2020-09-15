@@ -224,7 +224,7 @@ class FutureTradingEnv(gym.Env):
                     assert new_position > 0
                     new_average_position_price = (old_position * old_average_position_price + contract_valuation) / new_position
                 new_current_cash = old_current_cash - abs(contract_valuation) * (1 + 0)  # 0 penalty for buying
-                assert new_current_cash >= 0
+                # assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
@@ -252,7 +252,7 @@ class FutureTradingEnv(gym.Env):
                     new_average_position_price = old_average_position_price
                 realization_penalty = abs(contract_valuation) * self.penalty
                 new_current_cash = old_current_cash + abs(contract_valuation) - realization_penalty
-                assert new_current_cash >= 0
+                # assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
@@ -275,7 +275,7 @@ class FutureTradingEnv(gym.Env):
                 assert old_position + delta_position == 0
                 realization_penalty = abs(contract_valuation) * self.penalty
                 new_current_cash = old_current_cash + abs(contract_valuation) - realization_penalty
-                assert new_current_cash >= 0
+                # assert new_current_cash >= 0
 
                 self.average_position_price = 0
                 self.position = 0
@@ -301,7 +301,7 @@ class FutureTradingEnv(gym.Env):
                     assert new_position < 0
                     new_average_position_price = abs(short_contract_valuation / new_position)
                 new_current_cash = new_current_cash - abs(short_contract_valuation) * (1 + 0)  # 0 penalty for buy
-                assert new_current_cash >= 0
+                # assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
@@ -330,7 +330,7 @@ class FutureTradingEnv(gym.Env):
                     # same as
                     # new_average_position_price = (old_position * old_average_position_price + contract_valuation) / new_position
                 new_current_cash = old_current_cash - abs(contract_valuation) * (1 + 0)  # 0 penalty for buy
-                assert new_current_cash >= 0
+                # assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
@@ -359,7 +359,7 @@ class FutureTradingEnv(gym.Env):
                     new_average_position_price = old_average_position_price
                 realization_penalty = abs(contract_valuation) * self.penalty
                 new_current_cash = old_current_cash + abs(contract_valuation) - realization_penalty
-                assert new_current_cash >= 0
+                # assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
@@ -382,7 +382,7 @@ class FutureTradingEnv(gym.Env):
                 assert old_position + delta_position == 0
                 realization_penalty = abs(contract_valuation) * self.penalty
                 new_current_cash = old_current_cash + abs(contract_valuation) - realization_penalty
-                assert new_current_cash >= 0
+                # assert new_current_cash >= 0
 
                 self.average_position_price = 0
                 self.position = 0
@@ -410,7 +410,7 @@ class FutureTradingEnv(gym.Env):
                     assert new_position > 0
                     new_average_position_price = abs(long_contract_valuation / new_position)
                 new_current_cash = new_current_cash - abs(long_contract_valuation) * (1 + 0)  # 0 penalty for buy
-                assert new_current_cash >= 0
+                # assert new_current_cash >= 0
 
                 self.average_position_price = new_average_position_price
                 self.position = new_position
@@ -457,22 +457,29 @@ class FutureTradingEnv(gym.Env):
 
         reward = 0
 
-        use_realized_reward = False
+        use_reward_r = False
         allow_negative_r = True
+        weight_positive_r = None
 
-        use_position_reward = False
+        use_reward_p = False
         allow_negative_p = False
+        weight_positive_p = None
 
-        use_done_reward = True
+        use_hold_bonus = False
+
+        use_reward_d = True
         allow_negative_d = True
 
-        assert use_done_reward ^ use_realized_reward, 'done reward and realized reward cannot be used together'
+        assert not use_reward_d or not use_reward_r, 'done reward and realized reward cannot be used together'
 
-        if use_realized_reward:  # realized reward
+        if use_reward_r:  # realized reward
             if not self.train:
                 print(f'realized profit: {realized_profit}')
             if realized_profit > 0 or allow_negative_r:  # allow negative?
-                reward += realized_profit / self.initial_account_valuation
+                realized_reward = realized_profit / self.initial_account_valuation
+                if weight_positive_r is not None:
+                    realized_reward = realized_reward * weight_positive_r if realized_reward > 0 else realized_reward
+                reward += realized_reward
 
         # tick
         # evaluate current_price
@@ -484,30 +491,32 @@ class FutureTradingEnv(gym.Env):
                 columns = self.current_chart[ic]['columns']
                 past_tick_price = self.current_price
                 self.current_price = self.current_chart[ic]['data'][new_idx][columns.index('close')]
-                if use_position_reward:  # position reward
+                if use_reward_p:  # position reward
                     delta_price = self.current_price - past_tick_price
                     position_reward = delta_price * self.position / self.initial_account_valuation
                     # position_reward = position_reward ** 3
                     if not self.train:
                         print(f'delta position: {delta_price * self.position}')
                     if position_reward > 0 or allow_negative_p:  # allow negative?
-                        if holded and False:  # hold bonus
-                            position_reward *= 2
+                        if weight_positive_p is not None:
+                            position_reward = position_reward * weight_positive_p if position_reward > 0 else position_reward
                         reward += position_reward
+                if holded and use_hold_bonus:  # hold bonus
+                    if self.position != 0:
+                        reward += 0.01
 
         done = self.tick_to_close == 0
         if done:
             realized_profit, _ = self._trade(new_normalized_position=0.)  # liquidate all
-            if use_done_reward:  # done reward
+            if use_reward_d:  # done reward
                 done_reward = (self.current_account_valuation / self.initial_account_valuation) - 1.0
                 if done_reward > 0 or allow_negative_d:
                     reward += done_reward
-            elif use_realized_reward:  # realized reward at last step
+            elif use_reward_r:  # realized reward at last step
                 if realized_profit > 0 or allow_negative_r:  # allow negative?
                     reward += realized_profit / self.initial_account_valuation
 
         return self._observe(), reward, done, {}
-
     def _get_chart_data(self, tick, start_date_time, end_date_time):
         self.db_cursor.execute(f'select * from {self.validated_code_dict[self.current_code]}_{self.current_code}_{tick} where date >= ? and date <= ? order by date', (start_date_time, end_date_time))
         data = np.asarray(self.db_cursor.fetchall())
@@ -622,7 +631,7 @@ class FutureTradingEnv(gym.Env):
 
     def render(self, mode='human'):
         print('\n------------- RENDER START -------------')
-        print(f'code: {self.current_code}, date: {self.current_date}')
+        print(f'code: {self.current_code}, date: {self.current_date} profit: {self.get_daily_profit() * 100:.3f}%')
         print(self.action_buffer)
         print('------------- RENDER DONE -------------\n')
 
