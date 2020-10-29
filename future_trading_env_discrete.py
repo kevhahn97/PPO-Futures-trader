@@ -77,8 +77,9 @@ class FutureTradingEnvDiscrete(gym.Env):
     }
 
     def __init__(self, db_file_path, start_date, end_date, input_config: dict, action_steps=3, penalty=0.003, train=True):
-        assert action_steps >= 3, 'At least 3 steps are needed'
-        self._new_normalized_position_list = np.linspace(-1, 1, action_steps)
+        # assert action_steps >= 3, 'At least 3 steps are needed'
+        # self._new_normalized_position_list = np.linspace(-1, 1, action_steps)
+        self._new_normalized_position_list = ['hold', 'long', 'short', 'liquidate']
         self.ticks_per_trading_day = 377  # 15:19 - 09:01 = total 378 ticks. hence, it has 378 steps of size 1/377. last tick is changed to 15:18
         self.db_file_path = db_file_path
         self.start_date = start_date
@@ -115,7 +116,8 @@ class FutureTradingEnvDiscrete(gym.Env):
             columns = item['columns']
             # chart_obs_dict[key] = spaces.Box(low=0, high=np.inf, shape=(N, len(columns)))
             chart_features += N * len(columns)
-        self.action_space = spaces.Discrete(action_steps)
+        # self.action_space = spaces.Discrete(action_steps)
+        self.action_space = spaces.Discrete(4)
         # self.observation_space = spaces.Dict({
         #     'chart': spaces.Dict(chart_obs_dict),
         #     # 'account_valuation': spaces.Box(low=0, high=np.inf, shape=1),
@@ -184,15 +186,27 @@ class FutureTradingEnvDiscrete(gym.Env):
     def _normalize_price(self, price):
         return price / self.current_price - 1
 
-    def _normalize_chart(self, chart, columns):
+    def _normalize_chart(self, chart, columns, last_price):
         if 'volume' in columns:
             raise NotImplementedError
-        assert self.current_price == chart[-1][columns.index('close')]
-        return self._normalize_price(chart)
+        ohlc_indicies = [columns.index('open'), columns.index('high'), columns.index('low'), columns.index('close')]
+        normalized_chart = np.zeros_like(chart, dtype=np.float32)
+
+        # normalize o (ohlc_indicies[:1]) of first chart data with last_price
+        normalized_chart[:1, ohlc_indicies[:1]] = (chart[:1, ohlc_indicies[:1]] - last_price) / last_price
+
+        # normalize hlc (ohlc_indicies[1:]) with o (ohlc_indicies[:1])
+        normalized_chart[:, ohlc_indicies[1:]] = (chart[:, ohlc_indicies[1:]] - chart[:, ohlc_indicies[:1]]) / chart[:, ohlc_indicies[:1]]
+        if chart.shape[0] > 1:
+            # normalize o (ohlc_indicies[:1]) with before closes (ohlc_indicies[-1:])
+            normalized_chart[1:, ohlc_indicies[:1]] = (chart[1:, ohlc_indicies[:1]] - chart[:-1, ohlc_indicies[-1:]]) / chart[:-1, ohlc_indicies[-1:]]
+
+        # assert self.current_price == chart[-1][columns.index('close')]
+        # return self._normalize_price(chart)
+        return normalized_chart
 
     def _observe(self):
         flattened_feature_list = list()
-        # chart_obs_dict = dict()
         for key, item in sorted(self.input_config['chart'].items()):
             N, columns = item['N'], item['columns']
             column_indices = list()
@@ -200,9 +214,14 @@ class FutureTradingEnvDiscrete(gym.Env):
                 column_indices.append(self.current_chart[key]['columns'].index(column))
             date_slice = slice(self.current_chart[key]['current_idx'] - (N - 1), self.current_chart[key]['current_idx'] + 1)
             chart = self.current_chart[key]['data'][date_slice, column_indices]
-            # chart_obs_dict[key] = self._normalize_chart(chart, columns)
-            flattened_feature_list.append(self._normalize_chart(chart, columns).flatten())
+            last_price = self.current_chart[key]['data'][self.current_chart[key]['current_idx'] - N, self.current_chart[key]['columns'].index('close')]
+
+            flattened_feature_list.append(self._normalize_chart(chart, columns, last_price=last_price).flatten())
+            # flattened_feature_list.append(chart.flatten())
+
         average_position_price = self._normalize_price(self.average_position_price)
+        # average_position_price = self.average_position_price
+
         position = self.normalized_position
         # current_price_to_current_account_valuation = self.current_price / self.current_account_valuation
         # tick_to_close = self.tick_to_close / (self.ticks_per_trading_day - 1)
@@ -465,7 +484,19 @@ class FutureTradingEnvDiscrete(gym.Env):
         #     print('')
 
         # new_normalized_position = action[0] if not done else 0.
-        new_normalized_position = self._new_normalized_position_list[action]
+        if False:
+            new_normalized_position = self._new_normalized_position_list[action]
+        else:
+            contract_step = 0.2
+            if action == 0:  # hold
+                new_normalized_position = self.normalized_position
+            elif action == 1:  # long 50%
+                new_normalized_position = np.clip(self.normalized_position + contract_step, a_min=-1., a_max=1.)
+            elif action == 2:  # short 50%
+                new_normalized_position = np.clip(self.normalized_position - contract_step, a_min=-1., a_max=1.)
+            elif action == 3:  # liquidate all
+                new_normalized_position = 0
+
         old_position = self.position
         old_current_account_valuation = self.current_account_valuation
         realized_profit, holded = self._trade(new_normalized_position=new_normalized_position)
@@ -480,7 +511,7 @@ class FutureTradingEnvDiscrete(gym.Env):
 
         reward = 0
 
-        use_reward_r = False
+        use_reward_r = True
         allow_negative_r = True
         weight_positive_r = None
 
@@ -494,14 +525,14 @@ class FutureTradingEnvDiscrete(gym.Env):
         allow_negative_d = True
 
         use_no_action_penalty = False
-        no_action_penalty_n = 20
+        no_action_penalty_n = 2
 
         use_reward_ritter = True
 
         assert not use_reward_d or not use_reward_r, 'done reward and realized reward cannot be used together'
 
-        if use_reward_ritter:
-            assert not use_reward_r and not use_reward_p and not use_hold_bonus and not use_reward_d and not use_no_action_penalty, 'Reward Ritter must be used solely'
+        if use_reward_ritter and False:
+            assert not use_reward_r and not use_reward_p and not use_hold_bonus and not use_reward_d, 'Reward Ritter must be used solely'
 
         if use_reward_r:  # realized reward
             # if not self.train:
@@ -539,7 +570,7 @@ class FutureTradingEnvDiscrete(gym.Env):
         if use_no_action_penalty:
             last_n_actions = np.asarray(self.action_buffer[-no_action_penalty_n:])
             if len(last_n_actions) >= no_action_penalty_n and (last_n_actions == last_n_actions[-1]).all():
-                reward -= 0.01
+                reward -= 0.001 / 377
 
         done = self.tick_to_close == 0
         if done:
@@ -553,10 +584,11 @@ class FutureTradingEnvDiscrete(gym.Env):
                     reward += realized_profit / self.initial_account_valuation
         if use_reward_ritter:
             delta_v_t = (self.current_account_valuation - old_current_account_valuation) / self.initial_account_valuation
-            # delta_v_t /= self.initial_account_valuation
             k = 0
             reward_ritter = delta_v_t - k / 2 * (delta_v_t ** 2)
             reward += reward_ritter
+
+        # reward = 10 ** (reward) - (2 ** -0.) * 0
 
         return self._observe(), reward, done, {}
 
@@ -635,10 +667,12 @@ class FutureTradingEnvDiscrete(gym.Env):
         return self.current_account_valuation / self.initial_account_valuation - 1
 
     def print_profit(self):
-        if self.tick_to_close == 1:
-            print(f'Market closed. Current profit: {self.get_daily_profit() * 100}%')
+        if self.tick_to_close == 0:
+            print(f'Current profit: {self.get_daily_profit() * 100}%', end='\t')
 
     def reset(self, code: Optional[str] = None, date_idx: Optional[int] = None):
+        if self.tick_to_close is not None and self.train:
+            self.print_profit()
         self.action_buffer = []
         # choose code from db and date between [self.start_date, self.end_date]
         if self.db_cursor is None:
@@ -710,7 +744,8 @@ class FutureTradingEnvDiscrete(gym.Env):
 
 if __name__ == '__main__':
     db_file_path = 'db/200810_025124_주식분봉_122630.db'
-    env = FutureTradingEnvDiscrete(db_file_path=db_file_path, start_date=20190801, end_date=20200131, input_config={'1분': {'N': 128, 'columns': ['open', 'high', 'low', 'close']}})
+    input_config = {'chart': {'1분': {'N': 1, 'columns': ['close']}}, 'account': ['position', 'average_posiion']}
+    env = FutureTradingEnvDiscrete(db_file_path=db_file_path, start_date=20190801, end_date=20200131, input_config=input_config)
 
     obs = env.reset()
     cav, iav, price, ttc, cpv, cash, p, app, norm_p = env.current_account_valuation, env.initial_account_valuation, env.current_price, env.tick_to_close, env.current_position_valuation, env.current_cash, env.position, env.average_position_price, env.normalized_position

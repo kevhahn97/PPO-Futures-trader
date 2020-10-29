@@ -38,6 +38,7 @@ def get_geometric_average_and_cummulative_profit(model, env: Union[FutureTrading
                 obs, _, done, _ = env.step(action[0])
             if done:
                 daily_profit = env.get_daily_profit()
+                print(env.tick_to_close)
                 profit_list.append(daily_profit)
                 if verbose == 1:
                     print(version_name)
@@ -75,7 +76,7 @@ class ProfitCallback(BaseCallback):
         pass
 
     def _on_step(self) -> bool:
-        self.training_env.env_method('print_profit')
+        # self.training_env.env_method('print_profit')
         if self.num_timesteps % self.freq == 0:
             version = self.num_timesteps // self.freq - 1
             if not self.is_tb_set:
